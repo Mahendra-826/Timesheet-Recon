@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Runtime data (real client/employee timesheet data, generated per-run)
+input/
+output/
+schema.json
+employee_mapping.json
