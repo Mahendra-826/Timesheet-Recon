@@ -16,11 +16,11 @@ from config import (
     OUTPUT_FILE,
     PENDING_REVIEW_FILE,
     GEMINI_MODEL,
+    MATCH_COLOR,
+    MISMATCH_COLOR,
+    CLIENT_ONLY_COLOR,
 )
 from hours_governance import apply_pending_corrections
-
-
-
 
 
 def get_parent_month(parent_path):
@@ -58,8 +58,19 @@ def get_parent_month(parent_path):
     return "Unknown"
 
 
-st.title("Timesheet Governance UI")
-st.markdown("Upload the timesheets below, then run governance and download the output.")
+st.set_page_config(
+    page_title="Timesheet Governance",
+    page_icon="🧾",
+    layout="wide",
+)
+
+st.title("🧾 Timesheet Governance")
+st.caption(
+    "Reconcile the hours your client is invoicing against the hours your "
+    "own workforce actually logged — upload both timesheets, run the "
+    "check, and get back a color-coded report highlighting every "
+    "mismatch."
+)
 
 # --------------------------------------------------------------------
 # Session state
@@ -84,20 +95,25 @@ if "run_parent_path" not in st.session_state:
     st.session_state.run_parent_path = None
 
 # --------------------------------------------------------------------
-# Gemini configuration (sidebar)
-#
-# For deployment, the API key/model shouldn't have to live in the
-# server's venv/.env — the user provides them here instead. Left
-# blank, the run falls back to whatever is configured server-side
-# (config.py / .env), so this stays optional for local/dev use.
+# Sidebar: AI configuration + report color legend
 # --------------------------------------------------------------------
 
-st.sidebar.header("Gemini Configuration")
+st.sidebar.header("⚙️ AI Configuration")
+st.sidebar.caption(
+    "This tool reconciles the hours your client invoices (Fieldglass) "
+    "against the hours your own team actually logged (ASPIRE). Gemini "
+    "auto-detects each file's layout and matches employee names across "
+    "the two systems; the hours comparison itself then applies fixed, "
+    "auditable business rules to flag every match and mismatch."
+)
 
 gemini_api_key_input = st.sidebar.text_input(
     "Gemini API Key",
     type="password",
-    help="Used only for this run. Leave blank to use the server's configured key.",
+    help=(
+        "Used only for this run and never stored. Leave blank to use "
+        "the server's configured key."
+    ),
 )
 
 gemini_model_input = st.sidebar.text_input(
@@ -106,11 +122,49 @@ gemini_model_input = st.sidebar.text_input(
     help="e.g. gemini-2.5-flash",
 )
 
-client_file = st.file_uploader("Upload Client Timesheet (Expedia) (.xlsx)", type=["xlsx"], key="client")
-parent_file = st.file_uploader("Upload Parent Timesheet (Tenarai) (.xlsx)", type=["xlsx"], key="parent")
+st.sidebar.divider()
+st.sidebar.header("🎨 Report Color Legend")
 
-# Log mode dropdown: Final only (default) or Runtime streaming
-log_mode = st.selectbox("Log mode", ["Final only", "Runtime (stream)"], index=0)
+_LEGEND = [
+    (MATCH_COLOR, "Hours match"),
+    (MISMATCH_COLOR, "Hours don't match, or timesheet not Invoiced"),
+    (CLIENT_ONLY_COLOR, "Employee found in one timesheet but not the other"),
+]
+
+for _color, _label in _LEGEND:
+    st.sidebar.markdown(
+        f'<div style="display:flex;align-items:center;gap:8px;'
+        f'margin-bottom:6px;">'
+        f'<span style="width:14px;height:14px;border-radius:3px;'
+        f'background:#{_color};display:inline-block;'
+        f'border:1px solid rgba(0,0,0,0.15);flex-shrink:0;"></span>'
+        f'<span style="font-size:0.85rem;">{_label}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+# --------------------------------------------------------------------
+# Step 1: Upload timesheets
+# --------------------------------------------------------------------
+
+st.subheader("1. Upload timesheets")
+
+upload_col1, upload_col2 = st.columns(2)
+
+with upload_col1:
+    client_file = st.file_uploader(
+        "Fieldglass Timesheet (.xlsx)",
+        type=["xlsx"],
+        key="client",
+        help="The client's Fieldglass export — invoiced hours and status per week.",
+    )
+
+with upload_col2:
+    parent_file = st.file_uploader(
+        "ASPIRE Timesheet (.xlsx)",
+        type=["xlsx"],
+        key="parent",
+        help="Your own company's ASPIRE timesheet — hours actually logged per employee per day.",
+    )
 
 # Save uploads immediately using their original filenames so main.py can use them
 saved_client_path = None
@@ -122,9 +176,8 @@ if client_file is not None:
         saved_client_path = Path(INPUT_DIR) / client_file.name
         with open(saved_client_path, "wb") as f:
             f.write(client_file.getbuffer())
-        # saved silently
     except Exception as e:
-        st.warning(f"Could not save client upload immediately: {e}")
+        st.warning(f"Couldn't save the client file: {e}")
 
 if parent_file is not None:
     try:
@@ -132,26 +185,41 @@ if parent_file is not None:
         saved_parent_path = Path(INPUT_DIR) / parent_file.name
         with open(saved_parent_path, "wb") as f:
             f.write(parent_file.getbuffer())
-        # saved silently
     except Exception as e:
-        st.warning(f"Could not save parent upload immediately: {e}")
-detected_info = None
+        st.warning(f"Couldn't save the parent file: {e}")
 
-if st.button("Run Governance"):
-    # determine paths to run with
+# --------------------------------------------------------------------
+# Step 2: Run settings + trigger
+# --------------------------------------------------------------------
+
+st.subheader("2. Run governance")
+
+log_mode = st.selectbox(
+    "Log detail",
+    ["Final only", "Runtime (stream)"],
+    index=0,
+    help=(
+        "'Final only' shows the complete log once the run finishes. "
+        "'Runtime (stream)' shows progress live as it happens."
+    ),
+)
+
+run_clicked = st.button("▶ Run Governance", type="primary")
+
+if run_clicked:
     if saved_client_path is None and client_file is None:
-        st.error("Please upload a client timesheet.")
+        st.error("Please upload a client timesheet before running.")
         st.stop()
 
     if saved_parent_path is None and parent_file is None:
-        st.error("Please upload a parent timesheet.")
+        st.error("Please upload a parent company timesheet before running.")
         st.stop()
 
     # Use saved paths when available, otherwise fall back to configured paths
     run_client = saved_client_path if saved_client_path is not None else Path(CLIENT_TIMESHEET)
     run_parent = saved_parent_path if saved_parent_path is not None else Path(PARENT_TIMESHEET)
 
-    with st.spinner("Running main.py..."):
+    with st.spinner("Reconciling timesheets — this can take a moment..."):
         # Run main.py in unbuffered mode so live prints appear promptly
         cmd = [sys.executable, "-u", "main.py", str(run_client), str(run_parent)]
 
@@ -218,21 +286,27 @@ if st.button("Run Governance"):
         # the sole way to see what happened.
         full_logs = "".join(logs)
         if returncode != 0:
-            st.error("Processing failed. See logs below.")
+            st.error(
+                "Something went wrong during the run. Check the log "
+                "below for details."
+            )
 
             if log_mode != "Runtime (stream)":
-                with st.expander("Process logs (full)", expanded=False):
+                with st.expander("Full run log", expanded=False):
                     st.code(full_logs)
 
             if "503" in full_logs or "UNAVAILABLE" in full_logs:
-                st.warning("The model/service returned a 503 (high demand). Try again later or rerun.")
+                st.warning(
+                    "The Gemini service is temporarily overloaded (503). "
+                    "Please try again in a moment."
+                )
 
             st.session_state.processing_done = False
         else:
-            st.success("Processing completed.")
+            st.success("Reconciliation complete.")
 
             if log_mode != "Runtime (stream)":
-                with st.expander("Process logs (full)", expanded=False):
+                with st.expander("Full run log", expanded=False):
                     st.code(full_logs)
 
             # ----------------------------------------------------------------
@@ -266,13 +340,15 @@ if st.button("Run Governance"):
 
 if st.session_state.processing_done and not st.session_state.reviews_resolved:
 
+    st.subheader("3. Confirm flagged weeks")
+
     pending_items = st.session_state.pending_items
 
     st.warning(
-        f"{len(pending_items)} week(s) have a duplicate-entry "
-        "correction (e.g. hours entered, then reversed) and need you "
-        "to confirm the final Billable Hours before the report is "
-        "finalized."
+        f"{len(pending_items)} week(s) had hours entered and then "
+        "reversed (e.g. 40, then -40) with nothing after to confirm "
+        "the real total. Please enter the correct Billable Hours for "
+        "each before the report can be finalized."
     )
 
     with st.form("pending_review_form"):
@@ -287,8 +363,8 @@ if st.session_state.processing_done and not st.session_state.reviews_resolved:
             )
 
             st.caption(
-                f"Timesheet Status: {item['client_status'] or '(blank)'} "
-                f"— duplicate Billable Hours entries found: "
+                f"Timesheet status: {item['client_status'] or '(blank)'} "
+                f"· duplicate Billable Hours entries found: "
                 f"{item['original_values']}"
             )
 
@@ -298,7 +374,7 @@ if st.session_state.processing_done and not st.session_state.reviews_resolved:
                 key=f"pending_review_{index}",
             )
 
-        submitted = st.form_submit_button("Apply corrections & continue")
+        submitted = st.form_submit_button("Apply corrections & continue", type="primary")
 
     if submitted:
         apply_pending_corrections(confirmed_values)
@@ -313,6 +389,12 @@ if st.session_state.processing_done and not st.session_state.reviews_resolved:
 # --------------------------------------------------------------------
 
 if st.session_state.processing_done and st.session_state.reviews_resolved:
+
+    st.subheader("Reconciliation report")
+    st.caption(
+        "Colors follow the legend in the sidebar. Scroll within the "
+        "table to review every row before downloading."
+    )
 
     if OUTPUT_FILE.exists():
         # Provide a full-sheet styled HTML preview that preserves cell background colors
@@ -364,16 +446,16 @@ if st.session_state.processing_done and st.session_state.reviews_resolved:
             html = generate_colored_html(OUTPUT_FILE, max_height=max_preview_height)
             components.html(html, height=max_preview_height + 50)
         except Exception as e:
-            st.info(f"Could not render colored preview: {e}")
+            st.info(f"Couldn't render the colored preview: {e}")
         with open(OUTPUT_FILE, "rb") as f:
             data = f.read()
 
         st.download_button(
-            label="Download Output Excel",
+            label="⬇ Download reconciliation report",
             data=data,
             file_name=f"Reco_{get_parent_month(st.session_state.run_parent_path)}_file.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
         )
     else:
         st.error(f"Expected output file not found: {OUTPUT_FILE}")
-
