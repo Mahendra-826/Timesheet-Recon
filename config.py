@@ -20,6 +20,8 @@ OUTPUT_FILE = OUTPUT_DIR / "updated_client_timesheet.xlsx"
 
 PENDING_REVIEW_FILE = OUTPUT_DIR / "pending_review.json"
 
+SUMMARY_FILE = OUTPUT_DIR / "summary.json"
+
 MAPPING_FILE = BASE_DIR / "employee_mapping.json"
 
 # ==========================================

@@ -50,12 +50,69 @@ from config import (
     PARENT_TIMESHEET,
     OUTPUT_FILE,
     PENDING_REVIEW_FILE,
+    SUMMARY_FILE,
     MATCH_COLOR,
     MISMATCH_COLOR,
     MISSING_CLIENT_COLOR,
     CLIENT_ONLY_COLOR,
     PENDING_REVIEW_COLOR,
 )
+
+
+# ====================================================================
+# Cell color helpers
+# ====================================================================
+
+def _cell_fill_matches(cell, target_hex):
+    """True when a cell's fill color matches target_hex (a 6-digit hex
+    string, no '#')."""
+
+    try:
+        rgb = cell.fill.start_color.rgb
+    except Exception:
+        return False
+
+    if not rgb:
+        return False
+
+    return str(rgb)[-6:].upper() == target_hex.upper()
+
+
+def compute_compliance_summary(sheet, header_row, employee_col):
+    """
+    Count employees by the ACTUAL rendered color of their name cell in
+    the final workbook -- not by any internal tracking during the run.
+
+    This is deliberately the single source of truth: whatever the
+    report visually shows as Green/Red is exactly what gets counted,
+    so the summary can never drift out of sync with what's on screen.
+
+    MATCH_COLOR (green) -> compliant. MISMATCH_COLOR (red) ->
+    non-compliant. Any other color (blue client-only, yellow missing-
+    client-row, orange pending-review) is excluded from both counts.
+    """
+
+    compliant = 0
+    non_compliant = 0
+
+    for row in range(header_row + 1, sheet.max_row + 1):
+
+        employee_value = sheet.cell(row, employee_col).value
+
+        if employee_value is None or str(employee_value).strip() == "":
+            continue
+
+        cell = sheet.cell(row, employee_col)
+
+        if _cell_fill_matches(cell, MATCH_COLOR):
+            compliant += 1
+        elif _cell_fill_matches(cell, MISMATCH_COLOR):
+            non_compliant += 1
+
+    return {
+        "compliant": compliant,
+        "non_compliant": non_compliant,
+    }
 
 
 # ====================================================================
@@ -1861,6 +1918,116 @@ class HoursGovernance:
                 )
 
     # ================================================================
+    # Sort Red Employees First
+    # ================================================================
+
+    def sort_red_employees_first(self):
+        """
+        Physically move every employee whose name is highlighted RED
+        (per highlight_employee_names(), i.e. at least one final
+        weekly result was RED) to the top of the sheet, ahead of every
+        other employee, so mismatches are immediately visible without
+        scrolling.
+
+        MUST run last, after every cell's final fill/value is set --
+        this snapshots and rewrites whole rows (values, fills, fonts,
+        borders, number formats) as-is. Only the relative order of
+        rows within the "red" group and within the "everyone else"
+        group is preserved (a stable partition, not a full sort).
+        """
+
+        header_row = (
+            self.parent_schema["header_row"]
+            + 1
+        )
+
+        employee_col = (
+            self.parent_schema[
+                "employee_column"
+            ]["index"]
+            + 1
+        )
+
+        start_row = header_row + 1
+
+        end_row = self.sheet.max_row
+
+        max_col = self.sheet.max_column
+
+        # ------------------------------------------------------------
+        # Snapshot every employee data row
+        # ------------------------------------------------------------
+
+        row_snapshots = []
+
+        for row in range(start_row, end_row + 1):
+
+            employee_value = self.sheet.cell(
+                row,
+                employee_col,
+            ).value
+
+            if (
+                employee_value is None
+                or str(employee_value).strip() == ""
+            ):
+                continue
+
+            # This mirrors highlight_employee_names(): a row awaiting
+            # review is shown ORANGE, not RED, even if it also has an
+            # already-decided RED week, so it must not jump the queue
+            # until that review is resolved.
+            is_red = (
+                row not in self.pending_review_employees
+                and row in self.red_employees
+            )
+
+            cells = []
+
+            for col in range(1, max_col + 1):
+
+                cell = self.sheet.cell(row, col)
+
+                cells.append(
+                    {
+                        "value": cell.value,
+                        "fill": copy(cell.fill),
+                        "font": copy(cell.font),
+                        "border": copy(cell.border),
+                        "alignment": copy(cell.alignment),
+                        "number_format": cell.number_format,
+                    }
+                )
+
+            row_snapshots.append((is_red, cells))
+
+        # ------------------------------------------------------------
+        # Stable partition: RED rows first, original order preserved
+        # within each group
+        # ------------------------------------------------------------
+
+        row_snapshots.sort(key=lambda item: 0 if item[0] else 1)
+
+        # ------------------------------------------------------------
+        # Rewrite rows in the new order
+        # ------------------------------------------------------------
+
+        for offset, (_, cells) in enumerate(row_snapshots):
+
+            target_row = start_row + offset
+
+            for col_index, snapshot in enumerate(cells, start=1):
+
+                cell = self.sheet.cell(target_row, col_index)
+
+                cell.value = snapshot["value"]
+                cell.fill = snapshot["fill"]
+                cell.font = snapshot["font"]
+                cell.border = snapshot["border"]
+                cell.alignment = snapshot["alignment"]
+                cell.number_format = snapshot["number_format"]
+
+    # ================================================================
     # Highlight Missing Client Row
     # ================================================================
 
@@ -2177,6 +2344,15 @@ class HoursGovernance:
         self.highlight_employee_names()
 
         # ============================================================
+        # Move RED employees to the top of the report
+        #
+        # Must run last -- after every cell's final value/color is
+        # set -- since it snapshots and rewrites whole rows as-is.
+        # ============================================================
+
+        self.sort_red_employees_first()
+
+        # ============================================================
         # Save output
         # ============================================================
 
@@ -2219,6 +2395,40 @@ class HoursGovernance:
                 f"See {PENDING_REVIEW_FILE}"
             )
 
+        # ============================================================
+        # Save compliance summary
+        #
+        # Counted directly from each employee name cell's actual final
+        # color -- Green/Red exactly as shown in the report -- rather
+        # than from any internal tracking, so it can never drift out
+        # of sync with what the sheet visually displays.
+        # ============================================================
+
+        summary = compute_compliance_summary(
+            self.sheet,
+            self.parent_schema["header_row"] + 1,
+            self.parent_schema["employee_column"]["index"] + 1,
+        )
+
+        summary["pending_review"] = len(self.pending_review_employees)
+
+        SUMMARY_FILE.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with open(
+            SUMMARY_FILE,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            json.dump(
+                summary,
+                f,
+                indent=4,
+            )
+
         print(
             "\nOutput saved to file"
         )
@@ -2233,6 +2443,87 @@ class HoursGovernance:
 # original run, so "the colouring logic applies the same" once real
 # input is available.
 # ====================================================================
+
+def _move_red_rows_to_top(sheet, header_row, employee_col):
+    """
+    Physically move every employee row whose name cell is currently
+    filled MISMATCH_COLOR to the top of the sheet, ahead of every
+    other employee row, preserving relative order within each group.
+
+    Unlike HoursGovernance.sort_red_employees_first(), this reads
+    "is this row red?" directly from each name cell's fill rather
+    than from in-memory tracking sets -- there are none here, since
+    this runs later, in a separate process, against the already-saved
+    workbook.
+    """
+
+    def _is_mismatch_fill(cell):
+
+        try:
+            rgb = cell.fill.start_color.rgb
+        except Exception:
+            return False
+
+        if not rgb:
+            return False
+
+        return str(rgb)[-6:].upper() == MISMATCH_COLOR.upper()
+
+    start_row = header_row + 1
+
+    end_row = sheet.max_row
+
+    max_col = sheet.max_column
+
+    row_snapshots = []
+
+    for row in range(start_row, end_row + 1):
+
+        employee_value = sheet.cell(row, employee_col).value
+
+        if employee_value is None or str(employee_value).strip() == "":
+            continue
+
+        is_red = _is_mismatch_fill(
+            sheet.cell(row, employee_col)
+        )
+
+        cells = []
+
+        for col in range(1, max_col + 1):
+
+            cell = sheet.cell(row, col)
+
+            cells.append(
+                {
+                    "value": cell.value,
+                    "fill": copy(cell.fill),
+                    "font": copy(cell.font),
+                    "border": copy(cell.border),
+                    "alignment": copy(cell.alignment),
+                    "number_format": cell.number_format,
+                }
+            )
+
+        row_snapshots.append((is_red, cells))
+
+    row_snapshots.sort(key=lambda item: 0 if item[0] else 1)
+
+    for offset, (_, cells) in enumerate(row_snapshots):
+
+        target_row = start_row + offset
+
+        for col_index, snapshot in enumerate(cells, start=1):
+
+            cell = sheet.cell(target_row, col_index)
+
+            cell.value = snapshot["value"]
+            cell.fill = snapshot["fill"]
+            cell.font = snapshot["font"]
+            cell.border = snapshot["border"]
+            cell.alignment = snapshot["alignment"]
+            cell.number_format = snapshot["number_format"]
+
 
 def apply_pending_corrections(corrections):
     """
@@ -2361,11 +2652,36 @@ def apply_pending_corrections(corrections):
             red_fill if row_is_red else green_fill
         )
 
+    # ----------------------------------------------------------------
+    # Every pending week is now resolved to a final Green/Red -- move
+    # any employee who just became RED up with the rest, same as
+    # HoursGovernance.sort_red_employees_first() did for the original
+    # run. Redness is read directly from each name cell's fill here,
+    # since this function has no access to the original run's
+    # in-memory red_employees/pending_review_employees sets.
+    # ----------------------------------------------------------------
+
+    _move_red_rows_to_top(sheet, header_row, employee_col)
+
     workbook.save(OUTPUT_FILE)
 
     # Mark every pending review as resolved.
     with open(PENDING_REVIEW_FILE, "w", encoding="utf-8") as f:
         json.dump([], f, indent=4)
+
+    # ----------------------------------------------------------------
+    # Every pending week is now resolved -- recompute the summary the
+    # same way HoursGovernance.run() does: a full recount straight
+    # from each name cell's actual final color, not an incremental
+    # merge. That keeps this in permanent lockstep with what the sheet
+    # visually shows, with no way for the two to drift apart.
+    # ----------------------------------------------------------------
+
+    summary = compute_compliance_summary(sheet, header_row, employee_col)
+    summary["pending_review"] = 0
+
+    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=4)
 
     return len(pending)
 

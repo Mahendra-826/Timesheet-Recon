@@ -15,12 +15,23 @@ from config import (
     PARENT_TIMESHEET,
     OUTPUT_FILE,
     PENDING_REVIEW_FILE,
+    SUMMARY_FILE,
     GEMINI_MODEL,
     MATCH_COLOR,
     MISMATCH_COLOR,
     CLIENT_ONLY_COLOR,
 )
 from hours_governance import apply_pending_corrections
+
+
+def load_summary():
+    """Read the compliant/non-compliant counts HoursGovernance saved."""
+
+    if SUMMARY_FILE.exists():
+        with open(SUMMARY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    return {"compliant": 0, "non_compliant": 0, "pending_review": 0}
 
 
 def get_parent_month(parent_path):
@@ -73,6 +84,42 @@ st.caption(
 )
 
 # --------------------------------------------------------------------
+# Sign-in gate
+#
+# Hardcoded credentials for now -- placeholder access control until
+# real authentication is wired up. Nothing below this block (uploads,
+# sidebar, Run Governance) renders until the user signs in.
+# --------------------------------------------------------------------
+
+APP_USERNAME = "bizops"
+APP_PASSWORD = "bizops123"
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+
+    _, login_col, _ = st.columns([1, 1, 1])
+
+    with login_col:
+
+        st.subheader("Sign in")
+
+        with st.form("login_form"):
+            username_input = st.text_input("Username")
+            password_input = st.text_input("Password", type="password")
+            login_clicked = st.form_submit_button("Sign in", type="primary")
+
+        if login_clicked:
+            if username_input == APP_USERNAME and password_input == APP_PASSWORD:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect username or password.")
+
+    st.stop()
+
+# --------------------------------------------------------------------
 # Session state
 #
 # Streamlit reruns this whole script on every widget interaction, so
@@ -93,6 +140,9 @@ if "reviews_resolved" not in st.session_state:
 
 if "run_parent_path" not in st.session_state:
     st.session_state.run_parent_path = None
+
+if "summary" not in st.session_state:
+    st.session_state.summary = {"compliant": 0, "non_compliant": 0, "pending_review": 0}
 
 # --------------------------------------------------------------------
 # Sidebar: AI configuration + report color legend
@@ -152,7 +202,7 @@ upload_col1, upload_col2 = st.columns(2)
 
 with upload_col1:
     client_file = st.file_uploader(
-        "Fieldglass Timesheet (.xlsx)",
+        "Customer Timesheet",
         type=["xlsx"],
         key="client",
         help="The client's Fieldglass export — invoiced hours and status per week.",
@@ -160,7 +210,7 @@ with upload_col1:
 
 with upload_col2:
     parent_file = st.file_uploader(
-        "ASPIRE Timesheet (.xlsx)",
+        "ASPIRE Timesheet",
         type=["xlsx"],
         key="parent",
         help="Your own company's ASPIRE timesheet — hours actually logged per employee per day.",
@@ -325,6 +375,7 @@ if run_clicked:
             st.session_state.pending_items = pending_items
             st.session_state.reviews_resolved = len(pending_items) == 0
             st.session_state.run_parent_path = str(run_parent)
+            st.session_state.summary = load_summary()
 
 
 # --------------------------------------------------------------------
@@ -379,6 +430,7 @@ if st.session_state.processing_done and not st.session_state.reviews_resolved:
     if submitted:
         apply_pending_corrections(confirmed_values)
         st.session_state.reviews_resolved = True
+        st.session_state.summary = load_summary()
         st.rerun()
 
 # --------------------------------------------------------------------
@@ -391,6 +443,17 @@ if st.session_state.processing_done and not st.session_state.reviews_resolved:
 if st.session_state.processing_done and st.session_state.reviews_resolved:
 
     st.subheader("Reconciliation report")
+
+    summary_col1, summary_col2 = st.columns(2)
+    summary_col1.metric(
+        "✅ Compliant Employees",
+        st.session_state.summary.get("compliant", 0),
+    )
+    summary_col2.metric(
+        "⚠️ Non-Compliant Employees",
+        st.session_state.summary.get("non_compliant", 0),
+    )
+
     st.caption(
         "Colors follow the legend in the sidebar. Scroll within the "
         "table to review every row before downloading."
